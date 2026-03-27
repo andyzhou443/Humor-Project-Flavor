@@ -1,0 +1,6 @@
+@import "tailwindcss";
+
+/* Override Tailwind v4's default OS-level dark mode 
+  to listen for the .dark class injected by our page.tsx script 
+*/
+@variant dark (&:where(.dark, .dark *));
