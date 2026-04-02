@@ -69,12 +69,16 @@ export default async function Home({
     flavor_id?: string; 
     test_result?: string; 
     test_error?: string; 
+    ft_flavor_id?: string;
+    ft_result?: string;
+    ft_error?: string;
   }>;
 }) {
   const cookieStore = await cookies();
   const params = await searchParams;
   const activeTab = params.tab || "flavors";
   const selectedFlavorId = params.flavor_id ? parseInt(params.flavor_id, 10) : null;
+  const ftFlavorId = params.ft_flavor_id ? parseInt(params.ft_flavor_id, 10) : null;
   
   // Theme state retrieved from cookies (defaults to system)
   const currentTheme = cookieStore.get('theme')?.value || 'system';
@@ -142,10 +146,12 @@ export default async function Home({
       const { presignedUrl, cdnUrl } = await step1Res.json();
 
       // Step 2: Upload Image Bytes
+      const fileBytes = await file.arrayBuffer(); // Extract raw binary data
+
       const step2Res = await fetch(presignedUrl, {
         method: 'PUT',
         headers: { 'Content-Type': file.type },
-        body: file 
+        body: fileBytes // Pass the binary buffer instead of the proxy File object
       });
       if (!step2Res.ok) throw new Error(`Step 2 failed: ${step2Res.statusText}`);
 
@@ -159,7 +165,11 @@ export default async function Home({
         body: JSON.stringify({ imageUrl: cdnUrl, isCommonUse: false })
       });
       if (!step3Res.ok) throw new Error(`Step 3 failed: ${step3Res.statusText}`);
-      const { imageId } = await step3Res.json();
+      const step3Json = await step3Res.json();
+      // Support both camelCase (imageId) and snake_case (image_id) from the API
+      const imageId = step3Json.imageId ?? step3Json.image_id;
+      if (!imageId) throw new Error(`Step 3 did not return a valid imageId. Response was: ${JSON.stringify(step3Json)}`);
+
 
       // Step 4: Generate Captions
       const step4Res = await fetch(`${baseUrl}/pipeline/generate-captions`, {
@@ -173,14 +183,105 @@ export default async function Home({
           humorFlavorId: parseInt(flavorId, 10) 
         })
       });
-      if (!step4Res.ok) throw new Error(`Step 4 failed: ${step4Res.statusText}`);
+      if (!step4Res.ok) {
+        // Read the actual error body so the real backend message is surfaced
+        const errorBody = await step4Res.text().catch(() => step4Res.statusText);
+        throw new Error(`Step 4 failed (${step4Res.status}): ${errorBody}`);
+      }
       
-      const captionsArray = await step4Res.json();
-      const formattedResult = JSON.stringify(captionsArray, null, 2);
+      // The endpoint may return a JSON array or plain text depending on step config
+      const step4Text = await step4Res.text();
+      let formattedResult: string;
+      try {
+        const captionsArray = JSON.parse(step4Text);
+        formattedResult = JSON.stringify(captionsArray, null, 2);
+      } catch {
+        // Backend returned plain text — surface it as-is so the config issue is visible
+        formattedResult = step4Text;
+      }
 
       redirect(`/?tab=test&flavor_id=${flavorId}&test_result=${encodeURIComponent(formattedResult)}`);
     } catch (error: any) {
+      // Next.js redirect() works by throwing a special error internally — re-throw it
+      // so the redirect is not swallowed and mistakenly treated as a real error.
+      if (error?.message === 'NEXT_REDIRECT' || error?.digest?.startsWith('NEXT_REDIRECT')) {
+        throw error;
+      }
       redirect(`/?tab=test&flavor_id=${flavorId}&test_error=${encodeURIComponent(error.message)}`);
+    }
+  }
+
+  // --- FLAVOR TEST ACTION (same 4-step pipeline, separate URL state) ---
+  async function testFlavorAction(formData: FormData) {
+    'use server'
+    const flavorId = formData.get("ft_flavor_id") as string;
+    const file = formData.get("ft_image_file") as File;
+
+    try {
+      if (!file || file.size === 0) throw new Error("Please upload a valid image file.");
+
+      const actionClient = await createActionClient();
+      const { data: { session }, error: sessionError } = await actionClient.auth.getSession();
+      if (sessionError || !session?.access_token) throw new Error("Failed to retrieve valid Supabase session token.");
+
+      const token = session.access_token;
+      const baseUrl = "https://api.almostcrackd.ai";
+
+      // Step 1: Generate Presigned URL
+      const step1Res = await fetch(`${baseUrl}/pipeline/generate-presigned-url`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ contentType: file.type })
+      });
+      if (!step1Res.ok) throw new Error(`Step 1 failed: ${step1Res.statusText}`);
+      const { presignedUrl, cdnUrl } = await step1Res.json();
+
+      // Step 2: Upload Image Bytes
+      const step2Res = await fetch(presignedUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': file.type },
+        body: await file.arrayBuffer()
+      });
+      if (!step2Res.ok) throw new Error(`Step 2 failed: ${step2Res.statusText}`);
+
+      // Step 3: Register Image URL
+      const step3Res = await fetch(`${baseUrl}/pipeline/upload-image-from-url`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageUrl: cdnUrl, isCommonUse: false })
+      });
+      if (!step3Res.ok) throw new Error(`Step 3 failed: ${step3Res.statusText}`);
+      const step3Json = await step3Res.json();
+      const imageId = step3Json.imageId ?? step3Json.image_id;
+      if (!imageId) throw new Error(`Step 3 did not return a valid imageId. Response: ${JSON.stringify(step3Json)}`);
+
+      // Step 4: Generate Captions
+      const step4Res = await fetch(`${baseUrl}/pipeline/generate-captions`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ imageId, humorFlavorId: parseInt(flavorId, 10) })
+      });
+      if (!step4Res.ok) {
+        const errorBody = await step4Res.text().catch(() => step4Res.statusText);
+        throw new Error(`Step 4 failed (${step4Res.status}): ${errorBody}`);
+      }
+
+      const step4Text = await step4Res.text();
+      // Parse captions — backend returns a JSON array of strings, one per pipeline step
+      let captions: string[];
+      try {
+        const parsed = JSON.parse(step4Text);
+        captions = Array.isArray(parsed) ? parsed.map(String) : [String(parsed)];
+      } catch {
+        captions = [step4Text];
+      }
+
+      // Bundle CDN image URL + captions so the results page can render them together
+      const resultPayload = JSON.stringify({ imageUrl: cdnUrl, captions });
+      redirect(`/?tab=flavor-test&ft_flavor_id=${flavorId}&ft_result=${encodeURIComponent(resultPayload)}`);
+    } catch (error: any) {
+      if (error?.message === 'NEXT_REDIRECT' || error?.digest?.startsWith('NEXT_REDIRECT')) throw error;
+      redirect(`/?tab=flavor-test&ft_flavor_id=${flavorId}&ft_error=${encodeURIComponent(error.message)}`);
     }
   }
 
@@ -216,8 +317,10 @@ export default async function Home({
   async function createHumorFlavorStepAction(formData: FormData) {
     'use server'
     const actionClient = await createActionClient();
-    await actionClient.from('humor_flavor_steps').insert({ 
-      humor_flavor_id: parseInt(formData.get("humor_flavor_id") as string, 10),
+    const flavorId = formData.get("humor_flavor_id") as string;
+
+    const { error } = await actionClient.from('humor_flavor_steps').insert({ 
+      humor_flavor_id: parseInt(flavorId, 10),
       order_by: parseInt(formData.get("order_by") as string, 10),
       llm_temperature: formData.get("llm_temperature") ? parseFloat(formData.get("llm_temperature") as string) : null,
       llm_input_type_id: parseInt(formData.get("llm_input_type_id") as string, 10),
@@ -228,7 +331,17 @@ export default async function Home({
       llm_system_prompt: formData.get("llm_system_prompt") as string || null,
       llm_user_prompt: formData.get("llm_user_prompt") as string || null,
     });
-    revalidatePath('/');
+
+    // 1. Catch and expose the silent failure
+    if (error) {
+      console.error("Supabase Insert Error:", error);
+      // Throwing an error stops Next.js from wiping your form,
+      // allowing you to see what actually failed in your server console.
+      throw new Error(`Failed to create step: ${error.message}`);
+    }
+
+    // 2. Explicitly redirect to preserve your tab and flavor selection state
+    redirect(`/?tab=steps&flavor_id=${flavorId}`);
   }
 
   async function updateHumorFlavorStepAction(formData: FormData) {
@@ -318,6 +431,7 @@ export default async function Home({
             <Link href="?tab=steps" className={`whitespace-nowrap pb-1 ${activeTab === 'steps' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200'}`}>Humor Flavor Steps</Link>
             <Link href="?tab=captions" className={`whitespace-nowrap pb-1 ${activeTab === 'captions' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200'}`}>Read Captions</Link>
             <Link href="?tab=test" className={`whitespace-nowrap pb-1 ${activeTab === 'test' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200'}`}>Test API</Link>
+            <Link href="?tab=flavor-test" className={`whitespace-nowrap pb-1 ${activeTab === 'flavor-test' ? 'text-indigo-600 border-b-2 border-indigo-600' : 'text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-200'}`}>Flavor Test</Link>
           </div>
           
           <div className="flex items-center gap-4">
@@ -597,6 +711,133 @@ export default async function Home({
                 <p className="text-sm text-red-900 dark:text-red-100 font-medium">
                   {decodeURIComponent(params.test_error)}
                 </p>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* =========================================
+            TAB: FLAVOR TEST
+            ========================================= */}
+        {activeTab === "flavor-test" && (
+          <div className="w-full flex flex-col gap-8">
+            <div className="flex flex-col gap-2">
+              <h1 className="text-3xl font-bold tracking-tight">Flavor Test</h1>
+              <p className="text-zinc-500 text-sm">Pick a humor flavor, upload an image, and run the full caption pipeline.</p>
+            </div>
+
+            {/* Step 1: Flavor Picker */}
+            <div className="flex flex-col gap-3">
+              <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-500">1 — Choose a Flavor</h2>
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                {flavors.map(f => {
+                  const isSelected = ftFlavorId === f.id;
+                  return (
+                    <Link
+                      key={f.id}
+                      href={`/?tab=flavor-test&ft_flavor_id=${f.id}`}
+                      className={`flex flex-col gap-1.5 p-4 rounded-xl border transition-all cursor-pointer
+                        ${isSelected
+                          ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-950/40 dark:border-indigo-500 shadow-sm ring-2 ring-indigo-500/30'
+                          : 'border-zinc-200 bg-white hover:border-indigo-300 hover:bg-indigo-50/50 dark:bg-zinc-900 dark:border-zinc-800 dark:hover:border-indigo-700 dark:hover:bg-indigo-950/20'
+                        }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className={`text-sm font-semibold font-mono truncate ${isSelected ? 'text-indigo-700 dark:text-indigo-400' : 'text-zinc-800 dark:text-zinc-200'}`}>
+                          {f.slug}
+                        </span>
+                        {isSelected && (
+                          <span className="shrink-0 w-4 h-4 rounded-full bg-indigo-600 flex items-center justify-center">
+                            <svg className="w-2.5 h-2.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                              <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                            </svg>
+                          </span>
+                        )}
+                      </div>
+                      {f.description && (
+                        <p className="text-[11px] text-zinc-500 dark:text-zinc-400 line-clamp-2 leading-relaxed">{f.description}</p>
+                      )}
+                    </Link>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Step 2: Upload + Submit — only shown once a flavor is selected */}
+            {ftFlavorId ? (
+              <div className="flex flex-col gap-3">
+                <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-500">2 — Upload Image &amp; Generate</h2>
+                <div className="p-6 rounded-xl border border-zinc-200 bg-white shadow-sm dark:border-zinc-800 dark:bg-zinc-900 max-w-lg">
+                  <form action={testFlavorAction} className="flex flex-col gap-5">
+                    <input type="hidden" name="ft_flavor_id" value={ftFlavorId} />
+                    <div className="flex flex-col gap-2">
+                      <label className="text-sm font-semibold">Image File</label>
+                      <input
+                        name="ft_image_file"
+                        type="file"
+                        accept="image/jpeg, image/jpg, image/png, image/webp, image/gif, image/heic"
+                        required
+                        className="px-3 py-2 border border-zinc-300 rounded-md bg-transparent dark:border-zinc-700 outline-none focus:ring-2 focus:ring-indigo-500/50 file:mr-4 file:py-1 file:px-3 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-zinc-100 file:text-zinc-700 hover:file:bg-zinc-200 dark:file:bg-zinc-800 dark:file:text-zinc-300"
+                      />
+                    </div>
+                    <button type="submit" className="w-full py-2.5 bg-indigo-600 text-white font-bold rounded-md hover:bg-indigo-700 transition-colors">
+                      Run Pipeline →
+                    </button>
+                  </form>
+                </div>
+              </div>
+            ) : (
+              <div className="flex h-32 items-center justify-center border-2 border-dashed border-zinc-200 rounded-xl dark:border-zinc-800">
+                <p className="text-zinc-400 text-sm">Select a flavor above to continue.</p>
+              </div>
+            )}
+
+            {/* Results — one card per pipeline step showing image + caption */}
+            {params.ft_result && (() => {
+              let imageUrl = '';
+              let captions: string[] = [];
+              try {
+                const parsed = JSON.parse(decodeURIComponent(params.ft_result));
+                imageUrl = parsed.imageUrl ?? '';
+                captions = Array.isArray(parsed.captions) ? parsed.captions : [];
+              } catch { captions = [decodeURIComponent(params.ft_result)]; }
+              return (
+                <div className="flex flex-col gap-4">
+                  <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-500">3 — Results</h2>
+                  <div className="flex flex-col gap-6">
+                    {captions.map((caption, i) => (
+                      <div key={i} className="flex flex-col sm:flex-row gap-4 p-5 rounded-xl border border-zinc-200 bg-white shadow-sm dark:bg-zinc-900 dark:border-zinc-800">
+                        {/* Image */}
+                        {imageUrl && (
+                          <div className="shrink-0 sm:w-48">
+                            <img
+                              src={imageUrl}
+                              alt="Submitted image"
+                              className="w-full sm:w-48 h-40 object-cover rounded-lg border border-zinc-200 dark:border-zinc-700"
+                            />
+                          </div>
+                        )}
+                        {/* Caption */}
+                        <div className="flex flex-col gap-2 justify-center flex-1">
+                          <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-500">Step {i + 1}</span>
+                          <p className="text-base font-medium leading-relaxed text-zinc-800 dark:text-zinc-100">"{caption}"</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {params.ft_error && (
+              <div className="flex flex-col gap-3">
+                <h2 className="text-sm font-bold uppercase tracking-wider text-zinc-500">3 — Results</h2>
+                <div className="p-4 rounded-xl border border-red-200 bg-red-50 dark:bg-red-950/30 dark:border-red-900/50">
+                  <h3 className="text-xs font-bold text-red-700 dark:text-red-500 mb-2 uppercase tracking-wide">Request Failed:</h3>
+                  <p className="text-sm text-red-900 dark:text-red-100 font-medium">
+                    {decodeURIComponent(params.ft_error)}
+                  </p>
+                </div>
               </div>
             )}
           </div>
