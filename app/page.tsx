@@ -313,6 +313,70 @@ export default async function Home({
     revalidatePath('/');
   }
 
+  async function duplicateHumorFlavorAction(formData: FormData) {
+    'use server'
+    const id = parseInt(formData.get("id") as string, 10);
+    const newSlug = formData.get("new_slug") as string;
+
+    if (!newSlug || newSlug.trim() === "") {
+      throw new Error("Please provide a new, unique slug to duplicate.");
+    }
+
+    const actionClient = await createActionClient();
+
+    // 1. Fetch the original flavor
+    const { data: originalFlavor, error: fetchError } = await actionClient
+      .from('humor_flavors')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !originalFlavor) throw new Error("Original flavor not found.");
+
+    // 2. Insert the new flavor
+    const { data: newFlavor, error: insertError } = await actionClient
+      .from('humor_flavors')
+      .insert({ slug: newSlug.trim(), description: originalFlavor.description })
+      .select()
+      .single();
+
+    if (insertError || !newFlavor) {
+      throw new Error(`Failed to duplicate flavor. The slug might already exist. Details: ${insertError?.message || 'No data returned'}`);
+    }
+
+    // 3. Fetch all steps from the original flavor
+    const { data: steps } = await actionClient
+      .from('humor_flavor_steps')
+      .select('*')
+      .eq('humor_flavor_id', id);
+
+    // 4. Duplicate the steps, attaching them to the newly created flavor ID
+    if (steps && steps.length > 0) {
+      const duplicatedSteps = steps.map(step => ({
+        humor_flavor_id: newFlavor.id,
+        order_by: step.order_by,
+        llm_temperature: step.llm_temperature,
+        llm_input_type_id: step.llm_input_type_id,
+        llm_output_type_id: step.llm_output_type_id,
+        llm_model_id: step.llm_model_id,
+        humor_flavor_step_type_id: step.humor_flavor_step_type_id,
+        llm_system_prompt: step.llm_system_prompt,
+        llm_user_prompt: step.llm_user_prompt,
+        description: step.description
+      }));
+
+      const { error: stepsInsertError } = await actionClient
+        .from('humor_flavor_steps')
+        .insert(duplicatedSteps);
+
+      if (stepsInsertError) {
+        console.error("Failed to duplicate flavor steps:", stepsInsertError);
+      }
+    }
+
+    revalidatePath('/');
+  }
+
   // --- SERVER ACTIONS FOR STEPS ---
   async function createHumorFlavorStepAction(formData: FormData) {
     'use server'
@@ -487,24 +551,37 @@ export default async function Home({
               </div>
               <div className="divide-y divide-zinc-100 dark:divide-zinc-800">
                 {flavors.map((flavor) => (
-                  <form key={flavor.id} action={updateHumorFlavorAction} className="grid grid-cols-12 gap-4 items-start px-6 py-4 group hover:bg-zinc-50/50 dark:hover:bg-zinc-800/50 transition-colors">
-                    <input type="hidden" name="id" value={flavor.id} />
-                    <div className="col-span-3">
-                      <input required type="text" name="slug" defaultValue={flavor.slug} className="w-full text-sm font-mono text-indigo-600 dark:text-indigo-400 bg-transparent border border-transparent rounded px-2 py-1 outline-none focus:bg-white dark:focus:bg-zinc-950 focus:border-zinc-300 dark:focus:border-zinc-700" />
-                      <Link href={`/?tab=steps&flavor_id=${flavor.id}`} className="text-[10px] text-zinc-500 hover:text-indigo-600 mt-1 inline-block px-2">Manage Steps →</Link>
-                    </div>
-                    <div className="col-span-5">
-                      <textarea name="description" defaultValue={flavor.description || ''} rows={2} className="w-full text-sm text-zinc-700 dark:text-zinc-300 bg-transparent border border-transparent rounded px-2 py-1 outline-none resize-none focus:bg-white dark:focus:bg-zinc-950 focus:border-zinc-300 dark:focus:border-zinc-700" />
-                    </div>
-                    <div className="col-span-2 pt-1.5 text-[11px] text-zinc-400 font-medium">
-                      {new Date(flavor.created_datetime_utc).toLocaleDateString('en-US')}
-                    </div>
-                    <div className="col-span-2 flex flex-col items-end gap-2 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
-                      <button type="submit" className="text-xs font-bold text-indigo-600 hover:bg-indigo-50 px-3 py-1 rounded w-full border border-indigo-100 dark:border-indigo-800 dark:hover:bg-indigo-900/30">Update</button>
-                      <button formAction={deleteHumorFlavorAction} className="text-xs font-bold text-red-600 hover:bg-red-50 px-3 py-1 rounded w-full border border-red-100 dark:border-red-900/50 dark:hover:bg-red-900/30">Delete</button>
-                    </div>
-                  </form>
-                ))}
+  <form key={flavor.id} action={updateHumorFlavorAction} className="grid grid-cols-12 gap-4 items-start px-6 py-4 group hover:bg-zinc-50/50 dark:hover:bg-zinc-800/50 transition-colors">
+    <input type="hidden" name="id" value={flavor.id} />
+    
+    {/* --- NEW UPDATED COLUMN --- */}
+    <div className="col-span-3 flex flex-col items-start">
+      <input required type="text" name="slug" defaultValue={flavor.slug} className="w-full text-sm font-mono text-indigo-600 dark:text-indigo-400 bg-transparent border border-transparent rounded px-2 py-1 outline-none focus:bg-white dark:focus:bg-zinc-950 focus:border-zinc-300 dark:focus:border-zinc-700" />
+      <Link href={`/?tab=steps&flavor_id=${flavor.id}`} className="text-[10px] text-zinc-500 hover:text-indigo-600 mt-1 mb-3 inline-block px-2">Manage Steps →</Link>
+      
+      {/* Duplication UI (reveals on group hover) */}
+      <div className="flex flex-col gap-1 w-full px-2 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+        <span className="text-[9px] font-semibold text-zinc-400 uppercase tracking-wider">Duplicate Flavor</span>
+        <div className="flex gap-1 w-full">
+          <input type="text" name="new_slug" placeholder="New unique slug..." className="w-full text-xs bg-zinc-50 border border-zinc-200 rounded px-2 py-1 outline-none dark:bg-zinc-950 dark:border-zinc-700 focus:border-indigo-400 focus:bg-white" />
+          <button formAction={duplicateHumorFlavorAction} className="text-[10px] font-bold text-emerald-600 hover:bg-emerald-50 px-2 py-1 rounded border border-emerald-100 dark:border-emerald-900/50 dark:hover:bg-emerald-900/30">Copy</button>
+        </div>
+      </div>
+    </div>
+    {/* --------------------------- */}
+
+    <div className="col-span-5">
+      <textarea name="description" defaultValue={flavor.description || ''} rows={2} className="w-full text-sm text-zinc-700 dark:text-zinc-300 bg-transparent border border-transparent rounded px-2 py-1 outline-none resize-none focus:bg-white dark:focus:bg-zinc-950 focus:border-zinc-300 dark:focus:border-zinc-700" />
+    </div>
+    <div className="col-span-2 pt-1.5 text-[11px] text-zinc-400 font-medium">
+      {new Date(flavor.created_datetime_utc).toLocaleDateString('en-US')}
+    </div>
+    <div className="col-span-2 flex flex-col items-end gap-2 opacity-0 group-hover:opacity-100 focus-within:opacity-100">
+      <button type="submit" className="text-xs font-bold text-indigo-600 hover:bg-indigo-50 px-3 py-1 rounded w-full border border-indigo-100 dark:border-indigo-800 dark:hover:bg-indigo-900/30">Update</button>
+      <button formAction={deleteHumorFlavorAction} className="text-xs font-bold text-red-600 hover:bg-red-50 px-3 py-1 rounded w-full border border-red-100 dark:border-red-900/50 dark:hover:bg-red-900/30">Delete</button>
+    </div>
+  </form>
+))}
               </div>
             </div>
           </>
